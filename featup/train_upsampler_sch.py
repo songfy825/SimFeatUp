@@ -328,7 +328,23 @@ class SimFeatUp(pl.LightningModule):
         
         all_params.extend(list(self.projection_img.parameters()))
 
-        return torch.optim.NAdam(all_params, lr=self.lr)
+        optimizer = torch.optim.NAdam(all_params, lr=self.lr)
+        
+        # 基于step的学习率调度器
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, 
+            T_max=self.trainer.estimated_stepping_batches,  # 基于总step数
+            eta_min=self.lr * 0.1  # 最小学习率为初始学习率的10%
+        )
+        
+        return {
+            'optimizer': optimizer,
+            'lr_scheduler': {
+                'scheduler': scheduler,
+                'interval': 'step',  # 每个step更新一次学习率
+                'frequency': 1
+            }
+        }
 
 
 @hydra.main(config_path="configs", config_name="upsampler_aid.yaml")

@@ -132,7 +132,17 @@ class SimFeatUp(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         opt = self.optimizers()
-        opt.zero_grad()
+        
+        # 梯度累积参数
+        accumulate_grad_batches = 8 // self.trainer.datamodule.train_dataloader().batch_size \
+            if hasattr(self.trainer, 'datamodule') and self.trainer.datamodule \
+            else 8 // 4  # 默认batch size为4
+        
+        # 检查是否是累积步骤
+        should_update = (batch_idx + 1) % accumulate_grad_batches == 0
+
+        if should_update:
+            opt.zero_grad()
 
         with torch.no_grad():
             if type(batch) == dict:
@@ -147,6 +157,7 @@ class SimFeatUp(pl.LightningModule):
         full_tv_loss = 0.0
         full_total_loss = 0.0
         full_rec_img_loss = 0.0
+        
         for i in range(self.n_jitters):
             hr_feats = self.upsampler(lr_feats, img)
 
@@ -156,19 +167,19 @@ class SimFeatUp(pl.LightningModule):
             with torch.no_grad():
                 transform_params = sample_transform(
                     True, self.max_pad, self.max_zoom, img.shape[2], img.shape[3])
-                jit_img = apply_jitter(img, self.max_pad, transform_params) # 数据增强的图像
-                lr_jit_feats = self.model(jit_img) # 数据增强的低分辨率特征
+                jit_img = apply_jitter(img, self.max_pad, transform_params)
+                lr_jit_feats = self.model(jit_img)
 
             if self.random_projection is not None:
                 proj = torch.randn(lr_feats.shape[0],
-                                   lr_feats.shape[1],
-                                   self.random_projection, device=lr_feats.device)
+                                lr_feats.shape[1],
+                                self.random_projection, device=lr_feats.device)
                 proj /= proj.square().sum(1, keepdim=True).sqrt()
             else:
                 proj = None
 
             hr_jit_feats = apply_jitter(hr_feats, self.max_pad, transform_params)
-            proj_hr_feats = self.project(hr_jit_feats, proj) # Johnson–Lindenstrauss lemma
+            proj_hr_feats = self.project(hr_jit_feats, proj)
 
             down_jit_feats = self.project(self.downsampler(hr_jit_feats, jit_img), proj)
 
@@ -204,9 +215,11 @@ class SimFeatUp(pl.LightningModule):
             else:
                 tv_loss = 0.0
 
-            loss = rec_loss + self.crf_weight * crf_loss + self.tv_weight * tv_loss - self.filter_ent_weight * entropy_loss \
-                 + rec_img_loss * self.rec_img_weight
-            full_total_loss += loss.item()
+            # 应用梯度累积缩放因子
+            loss = (rec_loss + self.crf_weight * crf_loss + self.tv_weight * tv_loss - 
+                    self.filter_ent_weight * entropy_loss + rec_img_loss * self.rec_img_weight) / accumulate_grad_batches
+            
+            full_total_loss += loss.item() * accumulate_grad_batches
             self.manual_backward(loss)
 
         self.avg.add("loss/crf", full_crf_loss)
@@ -220,10 +233,13 @@ class SimFeatUp(pl.LightningModule):
             self.trainer.save_checkpoint(self.chkpt_dir[:-5] + '/' + self.chkpt_dir[:-5] + f'_{self.global_step}.ckpt')
 
         self.avg.logall(self.log)
+        
         if self.global_step < 10:
             self.clip_gradients(opt, gradient_clip_val=.0001, gradient_clip_algorithm="norm")
 
-        opt.step()
+        # 只在累积步骤结束时更新参数
+        if should_update:
+            opt.step()
 
         return None
 
@@ -318,6 +334,17 @@ class SimFeatUp(pl.LightningModule):
 
                 writer.flush()
 
+    # def configure_optimizers(self):
+    #     all_params = []
+    #     all_params.extend(list(self.downsampler.parameters()))
+    #     all_params.extend(list(self.upsampler.parameters()))
+
+    #     if self.predicted_uncertainty:
+    #         all_params.extend(list(self.scale_net.parameters()))
+        
+    #     all_params.extend(list(self.projection_img.parameters()))
+
+    #     return torch.optim.NAdam(all_params, lr=self.lr)
     def configure_optimizers(self):
         all_params = []
         all_params.extend(list(self.downsampler.parameters()))
@@ -328,7 +355,23 @@ class SimFeatUp(pl.LightningModule):
         
         all_params.extend(list(self.projection_img.parameters()))
 
-        return torch.optim.NAdam(all_params, lr=self.lr)
+        optimizer = torch.optim.NAdam(all_params, lr=self.lr)
+        
+        # 基于step的学习率调度器
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, 
+            T_max=self.trainer.estimated_stepping_batches,  # 基于总step数
+            eta_min=self.lr * 0.1  # 最小学习率为初始学习率的10%
+        )
+        
+        return {
+            'optimizer': optimizer,
+            'lr_scheduler': {
+                'scheduler': scheduler,
+                'interval': 'step',  # 每个step更新一次学习率
+                'frequency': 1
+            }
+        }
 
 
 @hydra.main(config_path="configs", config_name="upsampler_aid.yaml")

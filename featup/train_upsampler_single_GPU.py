@@ -1,32 +1,30 @@
+from featup.util import pca, RollingAvg, unnorm, norm, prep_image
+from featup.upsamplers import get_upsampler, LayerNorm2d
+from featup.losses import TVLoss, SampledCRFLoss, entropy
+from featup.layers import ChannelNorm
+from featup.featurizers.util import get_featurizer
+from featup.downsamplers import SimpleDownsampler, AttentionDownsampler
+from featup.datasets.util import get_dataset, SingleImageDataset
+from featup.datasets.JitteredImage import apply_jitter, sample_transform
+from os.path import join
+from torchvision.transforms import InterpolationMode
+from torch.utils.data import DataLoader
+from pytorch_lightning.loggers import TensorBoardLogger
+from pytorch_lightning.callbacks.early_stopping import EarlyStopping
+from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning import seed_everything
+from pytorch_lightning import Trainer
+from omegaconf import OmegaConf
+from omegaconf import DictConfig
+import torchvision.transforms as T
+import torch
+import pytorch_lightning as pl
+import hydra
+import os
+import gc
 import sys
 sys.path.insert(0, '../')
 
-import gc
-import os
-
-import hydra
-import pytorch_lightning as pl
-import torch
-import torchvision.transforms as T
-from omegaconf import DictConfig
-from omegaconf import OmegaConf
-from pytorch_lightning import Trainer
-from pytorch_lightning import seed_everything
-from pytorch_lightning.callbacks import ModelCheckpoint
-from pytorch_lightning.callbacks.early_stopping import EarlyStopping
-from pytorch_lightning.loggers import TensorBoardLogger
-from torch.utils.data import DataLoader
-from torchvision.transforms import InterpolationMode
-from os.path import join
-
-from featup.datasets.JitteredImage import apply_jitter, sample_transform
-from featup.datasets.util import get_dataset, SingleImageDataset
-from featup.downsamplers import SimpleDownsampler, AttentionDownsampler
-from featup.featurizers.util import get_featurizer
-from featup.layers import ChannelNorm
-from featup.losses import TVLoss, SampledCRFLoss, entropy
-from featup.upsamplers import get_upsampler, LayerNorm2d
-from featup.util import pca, RollingAvg, unnorm, norm, prep_image
 
 torch.multiprocessing.set_sharing_strategy('file_system')
 
@@ -82,16 +80,19 @@ class SimFeatUp(pl.LightningModule):
         self.rec_img_weight = rec_img_weight
         self.chkpt_dir = chkpt_dir
 
-        self.model, self.patch_size, self.dim = get_featurizer(model_type, activation_type, num_classes=1000)
+        self.model, self.patch_size, self.dim = get_featurizer(
+            model_type, activation_type, num_classes=1000)
         for p in self.model.parameters():
             p.requires_grad = False
         # self.model = torch.nn.Sequential(self.model, ChannelNorm(self.dim))
         self.upsampler = get_upsampler(upsampler, self.dim)
 
         if downsampler == 'simple':
-            self.downsampler = SimpleDownsampler(self.kernel_size, self.final_size)
+            self.downsampler = SimpleDownsampler(
+                self.kernel_size, self.final_size)
         elif downsampler == 'attention':
-            self.downsampler = AttentionDownsampler(self.dim, self.kernel_size, self.final_size, blur_attn=True)
+            self.downsampler = AttentionDownsampler(
+                self.dim, self.kernel_size, self.final_size, blur_attn=True)
         else:
             raise ValueError(f"Unknown downsampler {downsampler}")
 
@@ -120,7 +121,6 @@ class SimFeatUp(pl.LightningModule):
             torch.nn.Tanh()
         )
 
-
     def forward(self, x):
         return self.upsampler(self.model(x))
 
@@ -132,7 +132,17 @@ class SimFeatUp(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         opt = self.optimizers()
-        opt.zero_grad()
+
+        # 梯度累积参数
+        accumulate_grad_batches = 8 // self.trainer.datamodule.train_dataloader().batch_size \
+            if hasattr(self.trainer, 'datamodule') and self.trainer.datamodule \
+            else 8 // 4  # 默认batch size为4
+
+        # 检查是否是累积步骤
+        should_update = (batch_idx + 1) % accumulate_grad_batches == 0
+
+        if should_update:
+            opt.zero_grad()
 
         with torch.no_grad():
             if type(batch) == dict:
@@ -147,17 +157,19 @@ class SimFeatUp(pl.LightningModule):
         full_tv_loss = 0.0
         full_total_loss = 0.0
         full_rec_img_loss = 0.0
+
         for i in range(self.n_jitters):
             hr_feats = self.upsampler(lr_feats, img)
 
             if hr_feats.shape[2] != img.shape[2]:
-                hr_feats = torch.nn.functional.interpolate(hr_feats, img.shape[2:], mode="bilinear")
+                hr_feats = torch.nn.functional.interpolate(
+                    hr_feats, img.shape[2:], mode="bilinear")
 
             with torch.no_grad():
                 transform_params = sample_transform(
                     True, self.max_pad, self.max_zoom, img.shape[2], img.shape[3])
-                jit_img = apply_jitter(img, self.max_pad, transform_params) # 数据增强的图像
-                lr_jit_feats = self.model(jit_img) # 数据增强的低分辨率特征
+                jit_img = apply_jitter(img, self.max_pad, transform_params)
+                lr_jit_feats = self.model(jit_img)
 
             if self.random_projection is not None:
                 proj = torch.randn(lr_feats.shape[0],
@@ -167,18 +179,22 @@ class SimFeatUp(pl.LightningModule):
             else:
                 proj = None
 
-            hr_jit_feats = apply_jitter(hr_feats, self.max_pad, transform_params)
-            proj_hr_feats = self.project(hr_jit_feats, proj) # Johnson–Lindenstrauss lemma
+            hr_jit_feats = apply_jitter(
+                hr_feats, self.max_pad, transform_params)
+            proj_hr_feats = self.project(hr_jit_feats, proj)
 
-            down_jit_feats = self.project(self.downsampler(hr_jit_feats, jit_img), proj)
+            down_jit_feats = self.project(
+                self.downsampler(hr_jit_feats, jit_img), proj)
 
             if self.predicted_uncertainty:
                 scales = self.scale_net(lr_jit_feats)
                 scale_factor = (1 / (2 * scales ** 2))
                 mse = (down_jit_feats - self.project(lr_jit_feats, proj)).square()
-                rec_loss = (scale_factor * mse + scales.log()).mean() / self.n_jitters
+                rec_loss = (scale_factor * mse + scales.log()
+                            ).mean() / self.n_jitters
             else:
-                rec_loss = (self.project(lr_jit_feats, proj) - down_jit_feats).square().mean() / self.n_jitters
+                rec_loss = (self.project(lr_jit_feats, proj) -
+                            down_jit_feats).square().mean() / self.n_jitters
 
             full_rec_loss += rec_loss.item()
 
@@ -204,9 +220,11 @@ class SimFeatUp(pl.LightningModule):
             else:
                 tv_loss = 0.0
 
-            loss = rec_loss + self.crf_weight * crf_loss + self.tv_weight * tv_loss - self.filter_ent_weight * entropy_loss \
-                 + rec_img_loss * self.rec_img_weight
-            full_total_loss += loss.item()
+            # 应用梯度累积缩放因子
+            loss = (rec_loss + self.crf_weight * crf_loss + self.tv_weight * tv_loss -
+                    self.filter_ent_weight * entropy_loss + rec_img_loss * self.rec_img_weight) / accumulate_grad_batches
+
+            full_total_loss += loss.item() * accumulate_grad_batches
             self.manual_backward(loss)
 
         self.avg.add("loss/crf", full_crf_loss)
@@ -217,13 +235,18 @@ class SimFeatUp(pl.LightningModule):
         self.avg.add("loss/total", full_total_loss)
 
         if self.global_step % 100 == 0:
-            self.trainer.save_checkpoint(self.chkpt_dir[:-5] + '/' + self.chkpt_dir[:-5] + f'_{self.global_step}.ckpt')
+            self.trainer.save_checkpoint(
+                self.chkpt_dir[:-5] + '/' + self.chkpt_dir[:-5] + f'_{self.global_step}.ckpt')
 
         self.avg.logall(self.log)
-        if self.global_step < 10:
-            self.clip_gradients(opt, gradient_clip_val=.0001, gradient_clip_algorithm="norm")
 
-        opt.step()
+        if self.global_step < 10:
+            self.clip_gradients(opt, gradient_clip_val=.0001,
+                                gradient_clip_algorithm="norm")
+
+        # 只在累积步骤结束时更新参数
+        if should_update:
+            opt.step()
 
         return None
 
@@ -254,7 +277,8 @@ class SimFeatUp(pl.LightningModule):
                 rec_img = self.projection_img(hr_feats)
 
                 if hr_feats.shape[2] != img.shape[2]:
-                    hr_feats = torch.nn.functional.interpolate(hr_feats, img.shape[2:], mode="bilinear")
+                    hr_feats = torch.nn.functional.interpolate(
+                        hr_feats, img.shape[2:], mode="bilinear")
 
                 transform_params = sample_transform(
                     True, self.max_pad, self.max_zoom, img.shape[2], img.shape[3])
@@ -273,23 +297,36 @@ class SimFeatUp(pl.LightningModule):
 
                 writer = self.logger.experiment
 
-                hr_jit_feats = apply_jitter(hr_feats, self.max_pad, transform_params)
+                hr_jit_feats = apply_jitter(
+                    hr_feats, self.max_pad, transform_params)
                 down_jit_feats = self.downsampler(hr_jit_feats, jit_img)
 
                 [red_lr_feats], fit_pca = pca([lr_feats[0].unsqueeze(0)])
-                [red_hr_feats], _ = pca([hr_feats[0].unsqueeze(0)], fit_pca=fit_pca)
-                [red_lr_jit_feats], _ = pca([lr_jit_feats[0].unsqueeze(0)], fit_pca=fit_pca)
-                [red_hr_jit_feats], _ = pca([hr_jit_feats[0].unsqueeze(0)], fit_pca=fit_pca)
-                [red_down_jit_feats], _ = pca([down_jit_feats[0].unsqueeze(0)], fit_pca=fit_pca)
+                [red_hr_feats], _ = pca(
+                    [hr_feats[0].unsqueeze(0)], fit_pca=fit_pca)
+                [red_lr_jit_feats], _ = pca(
+                    [lr_jit_feats[0].unsqueeze(0)], fit_pca=fit_pca)
+                [red_hr_jit_feats], _ = pca(
+                    [hr_jit_feats[0].unsqueeze(0)], fit_pca=fit_pca)
+                [red_down_jit_feats], _ = pca(
+                    [down_jit_feats[0].unsqueeze(0)], fit_pca=fit_pca)
 
-                writer.add_image("viz/image", unnorm(img[0].unsqueeze(0))[0], self.global_step)
-                writer.add_image("viz/rec_image", unnorm(rec_img[0].unsqueeze(0))[0], self.global_step)
-                writer.add_image("viz/lr_feats", red_lr_feats[0], self.global_step)
-                writer.add_image("viz/hr_feats", red_hr_feats[0], self.global_step)
-                writer.add_image("jit_viz/jit_image", unnorm(jit_img[0].unsqueeze(0))[0], self.global_step)
-                writer.add_image("jit_viz/lr_jit_feats", red_lr_jit_feats[0], self.global_step)
-                writer.add_image("jit_viz/hr_jit_feats", red_hr_jit_feats[0], self.global_step)
-                writer.add_image("jit_viz/down_jit_feats", red_down_jit_feats[0], self.global_step)
+                writer.add_image(
+                    "viz/image", unnorm(img[0].unsqueeze(0))[0], self.global_step)
+                writer.add_image(
+                    "viz/rec_image", unnorm(rec_img[0].unsqueeze(0))[0], self.global_step)
+                writer.add_image(
+                    "viz/lr_feats", red_lr_feats[0], self.global_step)
+                writer.add_image(
+                    "viz/hr_feats", red_hr_feats[0], self.global_step)
+                writer.add_image(
+                    "jit_viz/jit_image", unnorm(jit_img[0].unsqueeze(0))[0], self.global_step)
+                writer.add_image("jit_viz/lr_jit_feats",
+                                 red_lr_jit_feats[0], self.global_step)
+                writer.add_image("jit_viz/hr_jit_feats",
+                                 red_hr_jit_feats[0], self.global_step)
+                writer.add_image("jit_viz/down_jit_feats",
+                                 red_down_jit_feats[0], self.global_step)
 
                 norm_scales = scales[0]
                 norm_scales /= scales.max()
@@ -299,13 +336,15 @@ class SimFeatUp(pl.LightningModule):
                 if isinstance(self.downsampler, SimpleDownsampler):
                     writer.add_image(
                         "down/filter",
-                        prep_image(self.downsampler.get_kernel().squeeze(), subtract_min=False),
+                        prep_image(self.downsampler.get_kernel(
+                        ).squeeze(), subtract_min=False),
                         self.global_step)
 
                 if isinstance(self.downsampler, AttentionDownsampler):
                     writer.add_image(
                         "down/att",
-                        prep_image(self.downsampler.forward_attention(hr_feats, None)[0]),
+                        prep_image(self.downsampler.forward_attention(
+                            hr_feats, None)[0]),
                         self.global_step)
                     writer.add_image(
                         "down/w",
@@ -325,7 +364,7 @@ class SimFeatUp(pl.LightningModule):
 
         if self.predicted_uncertainty:
             all_params.extend(list(self.scale_net.parameters()))
-        
+
         all_params.extend(list(self.projection_img.parameters()))
 
         return torch.optim.NAdam(all_params, lr=self.lr)
@@ -393,7 +432,7 @@ def my_app(cfg: DictConfig) -> None:
 
     loader = DataLoader(
         dataset, cfg.batch_size, shuffle=True, num_workers=cfg.num_workers)
-    
+
     val_loader = DataLoader(
         SingleImageDataset(0, dataset, 1), 1, shuffle=False, num_workers=cfg.num_workers)
 
